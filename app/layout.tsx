@@ -12,12 +12,10 @@ export const metadata: Metadata = {
     title: "ScoutHub",
     statusBarStyle: "default",
   },
-  formatDetection: {
-    telephone: false,
-  },
+  formatDetection: { telephone: false },
   themeColor: [
-    { media: "(prefers-color-scheme: dark)", color: "#0b0b0b" },
-    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#166534" },
+    { media: "(prefers-color-scheme: light)", color: "#166534" },
   ],
   icons: {
     icon: [
