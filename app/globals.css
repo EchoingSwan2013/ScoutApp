@@ -2,7 +2,12 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ============ THEME VARIABLES ============ */
+/* =========================================================
+   ScoutHub Theme (GREEN)
+   - Usa data-theme="dark" su <html> per il tema scuro
+   - Variabili usate da ui-btn / ui-btn-primary / ui-input / ui-card
+   ========================================================= */
+
 :root {
   --bg: #ffffff;
   --card: #ffffff;
@@ -10,7 +15,8 @@
   --muted: #44514a;
   --border: #d6e2da;
 
-  --primary-bg: #166534;      /* verde */
+  /* ✅ VERDE (tema) */
+  --primary-bg: #166534;      /* verde scuro */
   --primary-text: #ffffff;
 
   --pill: #e8f5ee;
@@ -18,14 +24,15 @@
   color-scheme: light;
 }
 
-[data-theme="dark"] {
+html[data-theme="dark"] {
   --bg: #0b0f0c;
   --card: #0f1a14;
   --text: #eaf3ee;
   --muted: #b3c4bc;
   --border: #203226;
 
-  --primary-bg: #22c55e;      /* verde più acceso per dark */
+  /* ✅ VERDE in dark più brillante */
+  --primary-bg: #22c55e;
   --primary-text: #06240f;
 
   --pill: #0f2a1a;
@@ -42,7 +49,10 @@ body {
   color: var(--text);
 }
 
-/* ============ UI CLASSES ============ */
+/* =========================================================
+   UI helpers (quelle classi che usi nel codice)
+   ========================================================= */
+
 .ui-card {
   border: 2px solid var(--border);
   background: var(--card);
@@ -69,7 +79,7 @@ body {
 
   border-radius: 12px;
   padding: 10px 12px;
-  font-weight: 800;
+  font-weight: 900;
 
   border: 2px solid var(--border);
   background: transparent;
@@ -79,8 +89,10 @@ body {
   user-select: none;
 }
 
+/* ✅ Hover verde (così “si vede” subito il tema) */
 .ui-btn:hover {
   border-color: var(--primary-bg);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--primary-bg) 18%, transparent);
 }
 
 .ui-btn:disabled,
@@ -95,6 +107,7 @@ body {
   color: var(--primary-text);
 }
 
+/* ✅ Focus verde */
 .ui-input {
   width: 100%;
   border-radius: 12px;
@@ -108,4 +121,5 @@ body {
 
 .ui-input:focus {
   border-color: var(--primary-bg);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--primary-bg) 18%, transparent);
 }
