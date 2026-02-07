@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { usePathname, useSearchParams } from "next/navigation";
+import { usePathname } from "next/navigation";
 import { onAuthStateChanged } from "firebase/auth";
 import {
   addDoc,
   collection,
+  deleteDoc,
   doc,
   getDoc,
   onSnapshot,
@@ -23,7 +24,6 @@ type RoomData = {
   adminUid: string;
   joinCode: string;
 
-  // ✅ Room settings
   defaultCanChat?: boolean;
   defaultCanCall?: boolean;
   lockChat?: boolean;
@@ -37,8 +37,8 @@ type Member = {
   uid: string;
   name: string;
   role: "admin" | "member";
-  canChat?: boolean; // override per membro
-  canCall?: boolean; // override per membro
+  canChat?: boolean;
+  canCall?: boolean;
   joinedAt?: any;
 };
 
@@ -48,6 +48,18 @@ type CallDoc = {
   offer?: any;
   answer?: any;
   status?: "open" | "connected" | "ended";
+};
+
+type VoiceStateDoc = {
+  callId?: string | null;
+  updatedAt?: any;
+  updatedByUid?: string;
+};
+
+type VoiceMember = {
+  uid: string;
+  name: string;
+  joinedAt?: any;
 };
 
 function loadSavedRooms(): SavedRoom[] {
@@ -79,14 +91,10 @@ export default function RoomPage() {
   const { theme, toggleTheme } = useTheme();
 
   const pathname = usePathname();
-  const searchParams = useSearchParams();
-
   const roomId = useMemo(() => {
     const parts = (pathname || "").split("/").filter(Boolean);
     return parts[1] || "";
   }, [pathname]);
-
-  const callFromUrl = useMemo(() => searchParams.get("call") || "", [searchParams]);
 
   const [user, setUser] = useState<any>(null);
 
@@ -109,9 +117,13 @@ export default function RoomPage() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [savingSettings, setSavingSettings] = useState<string | null>(null);
 
-  // CALLS
-  const [callId, setCallId] = useState<string>(callFromUrl);
-  const [callStatus, setCallStatus] = useState<string>("Nessuna chiamata attiva.");
+  // VOICE ROOM STATE
+  const [voiceCallId, setVoiceCallId] = useState<string | null>(null);
+  const [voiceMembers, setVoiceMembers] = useState<VoiceMember[]>([]);
+  const [voiceStatus, setVoiceStatus] = useState<string>("Vocale non attivo.");
+  const [inVoice, setInVoice] = useState(false);
+
+  // WebRTC
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -125,7 +137,7 @@ export default function RoomPage() {
     return () => unsub();
   }, []);
 
-  // Load room and ensure defaults exist
+  // Load room and ensure defaults exist, then create member using defaults
   useEffect(() => {
     if (!roomId) return;
 
@@ -136,32 +148,26 @@ export default function RoomPage() {
         return;
       }
 
-      const data = snap.data() as RoomData;
+      const data0 = snap.data() as RoomData;
 
-      // ✅ se mancano settings, mettiamo valori di default (solo la prima volta)
       const patch: Partial<RoomData> = {};
-      if (typeof data.defaultCanChat !== "boolean") patch.defaultCanChat = true;
-      if (typeof data.defaultCanCall !== "boolean") patch.defaultCanCall = true;
-      if (typeof data.lockChat !== "boolean") patch.lockChat = false;
-      if (typeof data.lockCalls !== "boolean") patch.lockCalls = false;
+      if (typeof data0.defaultCanChat !== "boolean") patch.defaultCanChat = true;
+      if (typeof data0.defaultCanCall !== "boolean") patch.defaultCanCall = true;
+      if (typeof data0.lockChat !== "boolean") patch.lockChat = false;
+      if (typeof data0.lockCalls !== "boolean") patch.lockCalls = false;
 
       if (Object.keys(patch).length > 0) {
         await updateDoc(doc(db, "rooms", roomId), patch as any);
-        // ricarico dopo l'update (o lascio che l'onSnapshot sotto aggiorni)
       }
 
-      setRoom({
-        ...data,
-        ...patch,
-      });
+      const data: RoomData = { ...data0, ...patch };
 
+      setRoom(data);
       setStatus("OK");
 
-      // aggiorna room salvate con nome/codice
       upsertRoom({ id: roomId, name: data.name, joinCode: data.joinCode });
       setSavedRooms(loadSavedRooms());
 
-      // membership base: crea doc member se manca (override vuoti)
       const u = auth.currentUser;
       if (u) {
         const isAdmin = data.adminUid === u.uid;
@@ -171,6 +177,8 @@ export default function RoomPage() {
             uid: u.uid,
             name: u.displayName ?? "utente",
             role: isAdmin ? "admin" : "member",
+            canChat: isAdmin ? true : (data.defaultCanChat ?? true),
+            canCall: isAdmin ? true : (data.defaultCanCall ?? true),
             joinedAt: serverTimestamp(),
           },
           { merge: true }
@@ -233,17 +241,13 @@ export default function RoomPage() {
     return () => unsub();
   }, [roomId]);
 
-  // Effective permissions: room settings + override per member + admin bypass
   const isAdmin = useMemo(() => myRole === "admin", [myRole]);
 
+  // Effective permissions
   const effectiveCanChat = useMemo(() => {
     if (!user || !room) return false;
     if (isAdmin) return true;
-
-    // lockChat blocca tutti i membri
     if (room.lockChat) return false;
-
-    // override member (se presente) altrimenti default della room
     if (typeof myOverrides.canChat === "boolean") return myOverrides.canChat;
     return room.defaultCanChat ?? true;
   }, [user, room, isAdmin, myOverrides.canChat]);
@@ -251,9 +255,7 @@ export default function RoomPage() {
   const effectiveCanCall = useMemo(() => {
     if (!user || !room) return false;
     if (isAdmin) return true;
-
     if (room.lockCalls) return false;
-
     if (typeof myOverrides.canCall === "boolean") return myOverrides.canCall;
     return room.defaultCanCall ?? true;
   }, [user, room, isAdmin, myOverrides.canCall]);
@@ -272,27 +274,75 @@ export default function RoomPage() {
     });
   };
 
-  // -------- CALLS (WebRTC MVP) --------
+  // -------- VOICE ROOM: Firestore state + members presence --------
+  useEffect(() => {
+    if (!roomId) return;
+
+    const voiceRef = doc(db, "rooms", roomId, "voice", "current");
+    const unsub = onSnapshot(voiceRef, (snap) => {
+      if (!snap.exists()) {
+        setVoiceCallId(null);
+        setVoiceStatus("Vocale non attivo.");
+        return;
+      }
+      const data = snap.data() as VoiceStateDoc;
+      const cid = (data.callId ?? null) as any;
+      setVoiceCallId(typeof cid === "string" ? cid : null);
+      setVoiceStatus(typeof cid === "string" ? "Vocale attivo." : "Vocale non attivo.");
+    });
+
+    return () => unsub();
+  }, [roomId]);
+
+  useEffect(() => {
+    if (!roomId) return;
+
+    const q = query(collection(db, "rooms", roomId, "voiceMembers"), orderBy("joinedAt", "asc"));
+    const unsub = onSnapshot(q, (snap) => {
+      const list: VoiceMember[] = snap.docs.map((d) => d.data() as any);
+      setVoiceMembers(list);
+    });
+
+    return () => unsub();
+  }, [roomId]);
+
+  // -------- WebRTC (riusiamo la stessa logica ma senza link) --------
   const iceServers = useMemo(
     () => ({ iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] }),
     []
   );
 
   const cleanupCall = async () => {
-    try { pcRef.current?.close(); } catch {}
+    try {
+      pcRef.current?.close();
+    } catch {}
     pcRef.current = null;
 
-    try { localStreamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
+    try {
+      localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    } catch {}
     localStreamRef.current = null;
 
-    setCallStatus("Chiamata chiusa.");
+    try {
+      if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+    } catch {}
+
+    setInVoice(false);
   };
 
-  const createCall = async () => {
-    if (!user) return;
-    if (!effectiveCanCall) return setCallStatus("Non hai i permessi per fare chiamate.");
+  const createCallDoc = async () => {
+    if (!user) throw new Error("Not logged");
+    const callRef = await addDoc(collection(db, "rooms", roomId, "calls"), {
+      createdAt: serverTimestamp(),
+      createdByUid: user.uid,
+      status: "open",
+    } as CallDoc);
+    return callRef.id;
+  };
 
-    setCallStatus("Creo chiamata…");
+  const startAsCaller = async (callId: string) => {
+    if (!user) return;
+    setVoiceStatus("Entro in vocale… (creo sessione)");
 
     const localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
     localStreamRef.current = localStream;
@@ -308,16 +358,7 @@ export default function RoomPage() {
       if (remoteAudioRef.current) remoteAudioRef.current.srcObject = remoteStream;
     };
 
-    const callRef = await addDoc(collection(db, "rooms", roomId, "calls"), {
-      createdAt: serverTimestamp(),
-      createdByUid: user.uid,
-      status: "open",
-    } as CallDoc);
-
-    const newCallId = callRef.id;
-    setCallId(newCallId);
-
-    const offerCandidates = collection(db, "rooms", roomId, "calls", newCallId, "offerCandidates");
+    const offerCandidates = collection(db, "rooms", roomId, "calls", callId, "offerCandidates");
     pc.onicecandidate = async (event) => {
       if (event.candidate) await addDoc(offerCandidates, event.candidate.toJSON());
     };
@@ -325,50 +366,55 @@ export default function RoomPage() {
     const offerDescription = await pc.createOffer();
     await pc.setLocalDescription(offerDescription);
 
-    await updateDoc(doc(db, "rooms", roomId, "calls", newCallId), {
+    await updateDoc(doc(db, "rooms", roomId, "calls", callId), {
       offer: { type: offerDescription.type, sdp: offerDescription.sdp },
     });
 
-    setCallStatus("Chiamata creata. Condividi il link o attendi che qualcuno si unisca.");
-
-    onSnapshot(doc(db, "rooms", roomId, "calls", newCallId), async (snap) => {
+    // listen for answer
+    onSnapshot(doc(db, "rooms", roomId, "calls", callId), async (snap) => {
       const data = snap.data() as any;
       if (!data) return;
-
       if (!pc.currentRemoteDescription && data.answer) {
         await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-        setCallStatus("Connesso ✅ (audio attivo)");
+        setVoiceStatus("Connesso ✅ (audio)");
       }
-      if (data.status === "ended") await cleanupCall();
+      if (data.status === "ended") {
+        setVoiceStatus("Vocale chiuso.");
+        await cleanupCall();
+      }
     });
 
-    const answerCandidates = collection(db, "rooms", roomId, "calls", newCallId, "answerCandidates");
+    // listen for answer candidates
+    const answerCandidates = collection(db, "rooms", roomId, "calls", callId, "answerCandidates");
     onSnapshot(answerCandidates, (snap) => {
       snap.docChanges().forEach(async (change) => {
         if (change.type === "added") {
-          try { await pc.addIceCandidate(new RTCIceCandidate(change.doc.data())); } catch {}
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(change.doc.data()));
+          } catch {}
         }
       });
     });
 
-    const url = new URL(window.location.href);
-    url.searchParams.set("call", newCallId);
-    window.history.replaceState({}, "", url.toString());
+    setInVoice(true);
+    setVoiceStatus("In vocale ✅");
   };
 
-  const joinCall = async () => {
+  const joinAsCallee = async (callId: string) => {
     if (!user) return;
-    if (!effectiveCanCall) return setCallStatus("Non hai i permessi per fare chiamate.");
-    if (!callId) return;
-
-    setCallStatus("Mi unisco alla chiamata…");
+    setVoiceStatus("Entro in vocale… (mi unisco)");
 
     const callDocRef = doc(db, "rooms", roomId, "calls", callId);
     const callSnap = await getDoc(callDocRef);
-    if (!callSnap.exists()) return setCallStatus("Chiamata non trovata.");
-
+    if (!callSnap.exists()) {
+      setVoiceStatus("Sessione vocale non trovata.");
+      return;
+    }
     const callData = callSnap.data() as any;
-    if (!callData.offer) return setCallStatus("Chiamata non pronta (manca offer).");
+    if (!callData.offer) {
+      setVoiceStatus("Sessione non pronta (manca offer). Riprova tra 2 secondi.");
+      return;
+    }
 
     const localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
     localStreamRef.current = localStream;
@@ -399,57 +445,148 @@ export default function RoomPage() {
       status: "connected",
     });
 
-    setCallStatus("Connesso ✅ (audio attivo)");
-
+    // offer candidates
     const offerCandidates = collection(db, "rooms", roomId, "calls", callId, "offerCandidates");
     onSnapshot(offerCandidates, (snap) => {
       snap.docChanges().forEach(async (change) => {
         if (change.type === "added") {
-          try { await pc.addIceCandidate(new RTCIceCandidate(change.doc.data())); } catch {}
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(change.doc.data()));
+          } catch {}
         }
       });
     });
 
-    const url = new URL(window.location.href);
-    url.searchParams.set("call", callId);
-    window.history.replaceState({}, "", url.toString());
+    // end handling
+    onSnapshot(callDocRef, async (snap) => {
+      const data = snap.data() as any;
+      if (!data) return;
+      if (data.status === "ended") {
+        setVoiceStatus("Vocale chiuso.");
+        await cleanupCall();
+      }
+    });
+
+    setInVoice(true);
+    setVoiceStatus("In vocale ✅");
   };
 
-  const hangUp = async () => {
-    if (roomId && callId) {
-      try { await updateDoc(doc(db, "rooms", roomId, "calls", callId), { status: "ended" }); } catch {}
+  const ensureVoiceStateDoc = async () => {
+    const voiceRef = doc(db, "rooms", roomId, "voice", "current");
+    const snap = await getDoc(voiceRef);
+    if (!snap.exists()) {
+      await setDoc(
+        voiceRef,
+        { callId: null, updatedAt: serverTimestamp(), updatedByUid: user?.uid ?? null } as VoiceStateDoc,
+        { merge: true }
+      );
     }
-    await cleanupCall();
-
-    const url = new URL(window.location.href);
-    url.searchParams.delete("call");
-    window.history.replaceState({}, "", url.toString());
   };
 
-  const callLink = useMemo(() => {
-    if (!callId) return "";
-    const url = new URL(window.location.href);
-    url.searchParams.set("call", callId);
-    return url.toString();
-  }, [callId]);
+  const enterVoice = async () => {
+    if (!user || !roomId) return;
+    if (!effectiveCanCall) {
+      setVoiceStatus("Non hai permessi per il vocale in questa room.");
+      return;
+    }
 
-  const copyCallLink = async () => {
-    if (!callLink) return;
+    await ensureVoiceStateDoc();
+
+    // presence
+    await setDoc(
+      doc(db, "rooms", roomId, "voiceMembers", user.uid),
+      {
+        uid: user.uid,
+        name: user.displayName ?? "utente",
+        joinedAt: serverTimestamp(),
+      } as VoiceMember,
+      { merge: true }
+    );
+
+    const voiceRef = doc(db, "rooms", roomId, "voice", "current");
+    const snap = await getDoc(voiceRef);
+    const data = snap.exists() ? (snap.data() as VoiceStateDoc) : { callId: null };
+
+    // if no callId → create new call + set voice/current
+    if (!data.callId) {
+      setVoiceStatus("Creo stanza vocale…");
+      const newCallId = await createCallDoc();
+      await updateDoc(voiceRef, {
+        callId: newCallId,
+        updatedAt: serverTimestamp(),
+        updatedByUid: user.uid,
+      } as any);
+
+      setVoiceCallId(newCallId);
+      await startAsCaller(newCallId);
+      return;
+    }
+
+    // else join existing
+    const cid = data.callId as string;
+    setVoiceCallId(cid);
+
+    // se sono io che ho creato e non sono connesso, parto da caller solo se non esiste answer
+    // (semplice: proviamo joinAsCallee; se non pronta, riproverà)
+    await joinAsCallee(cid);
+  };
+
+  const exitVoice = async () => {
+    if (!user || !roomId) return;
+
+    // remove presence
     try {
-      await navigator.clipboard.writeText(callLink);
-      setCallStatus("Link copiato ✅ incollalo in chat.");
-    } catch {
-      setCallStatus("Non riesco a copiare. Copia manualmente il link.");
-    }
+      await deleteDoc(doc(db, "rooms", roomId, "voiceMembers", user.uid));
+    } catch {}
+
+    // hang up local
+    await cleanupCall();
+    setVoiceStatus("Sei uscito dal vocale.");
   };
+
+  const closeVoiceForAll = async () => {
+    if (!isAdmin || !roomId) return;
+    const voiceRef = doc(db, "rooms", roomId, "voice", "current");
+    const snap = await getDoc(voiceRef);
+    const data = snap.exists() ? (snap.data() as VoiceStateDoc) : null;
+
+    // end call doc
+    if (data?.callId) {
+      try {
+        await updateDoc(doc(db, "rooms", roomId, "calls", data.callId), { status: "ended" } as any);
+      } catch {}
+    }
+
+    // reset voice current
+    await setDoc(
+      voiceRef,
+      { callId: null, updatedAt: serverTimestamp(), updatedByUid: user?.uid ?? null } as VoiceStateDoc,
+      { merge: true }
+    );
+
+    setVoiceCallId(null);
+    setVoiceStatus("Vocale chiuso per tutti.");
+  };
+
+  // Safety: on unload remove voice presence
+  useEffect(() => {
+    const handler = () => {
+      try {
+        const u = auth.currentUser;
+        if (u && roomId) {
+          // fire-and-forget
+          deleteDoc(doc(db, "rooms", roomId, "voiceMembers", u.uid)).catch(() => {});
+        }
+      } catch {}
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [roomId]);
 
   const goToRoom = (id: string) => {
-    setCallId("");
-    setCallStatus("Nessuna chiamata attiva.");
     window.location.href = `/room/${id}`;
   };
 
-  // ✅ Room Settings actions
   const updateRoomSetting = async (patch: Partial<RoomData>) => {
     if (!isAdmin) return;
     if (!roomId) return;
@@ -496,7 +633,15 @@ export default function RoomPage() {
                     <div style={{ fontWeight: 900 }}>{r.name ?? "Room"}</div>
                     <div style={{ marginTop: 4 }}>
                       <span className="ui-pill">
-                        {r.joinCode ? <>cod: <b>{r.joinCode}</b></> : <>id: <b>{r.id}</b></>}
+                        {r.joinCode ? (
+                          <>
+                            cod: <b>{r.joinCode}</b>
+                          </>
+                        ) : (
+                          <>
+                            id: <b>{r.id}</b>
+                          </>
+                        )}
                       </span>
                     </div>
                   </button>
@@ -518,7 +663,7 @@ export default function RoomPage() {
             <div style={{ marginTop: 8, color: "var(--muted)", fontSize: 13 }}>
               <b>{isAdmin ? "ADMIN" : "MEMBER"}</b>
               <br />
-              Chat: <b>{effectiveCanChat ? "OK" : "NO"}</b> • Call: <b>{effectiveCanCall ? "OK" : "NO"}</b>
+              Chat: <b>{effectiveCanChat ? "OK" : "NO"}</b> • Vocale: <b>{effectiveCanCall ? "OK" : "NO"}</b>
             </div>
           </div>
         </aside>
@@ -561,7 +706,7 @@ export default function RoomPage() {
           </div>
         </div>
 
-        {/* ✅ ROOM SETTINGS */}
+        {/* ROOM SETTINGS */}
         {isAdmin && (
           <div className="ui-card" style={{ marginTop: 16 }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
@@ -579,29 +724,17 @@ export default function RoomPage() {
                 <div style={settingRow}>
                   <div>
                     <div style={{ fontWeight: 900 }}>Default chat per nuovi membri</div>
-                    <div style={{ marginTop: 4, color: "var(--muted)", fontSize: 13 }}>
-                      Se ON, chi entra in room può scrivere subito (a meno di override).
-                    </div>
                   </div>
-                  <button
-                    className="ui-btn"
-                    onClick={() => updateRoomSetting({ defaultCanChat: !(room?.defaultCanChat ?? true) })}
-                  >
+                  <button className="ui-btn" onClick={() => updateRoomSetting({ defaultCanChat: !(room?.defaultCanChat ?? true) })}>
                     {room?.defaultCanChat ?? true ? "ON" : "OFF"}
                   </button>
                 </div>
 
                 <div style={settingRow}>
                   <div>
-                    <div style={{ fontWeight: 900 }}>Default chiamate per nuovi membri</div>
-                    <div style={{ marginTop: 4, color: "var(--muted)", fontSize: 13 }}>
-                      Se ON, chi entra può usare le chiamate subito (a meno di override).
-                    </div>
+                    <div style={{ fontWeight: 900 }}>Default vocale per nuovi membri</div>
                   </div>
-                  <button
-                    className="ui-btn"
-                    onClick={() => updateRoomSetting({ defaultCanCall: !(room?.defaultCanCall ?? true) })}
-                  >
+                  <button className="ui-btn" onClick={() => updateRoomSetting({ defaultCanCall: !(room?.defaultCanCall ?? true) })}>
                     {room?.defaultCanCall ?? true ? "ON" : "OFF"}
                   </button>
                 </div>
@@ -609,9 +742,6 @@ export default function RoomPage() {
                 <div style={settingRow}>
                   <div>
                     <div style={{ fontWeight: 900 }}>Blocca chat per tutti</div>
-                    <div style={{ marginTop: 4, color: "var(--muted)", fontSize: 13 }}>
-                      Se ON, solo l’admin può scrivere (override ignorati).
-                    </div>
                   </div>
                   <button className="ui-btn" onClick={() => updateRoomSetting({ lockChat: !(room?.lockChat ?? false) })}>
                     {room?.lockChat ?? false ? "ON" : "OFF"}
@@ -620,141 +750,62 @@ export default function RoomPage() {
 
                 <div style={settingRow}>
                   <div>
-                    <div style={{ fontWeight: 900 }}>Blocca chiamate per tutti</div>
-                    <div style={{ marginTop: 4, color: "var(--muted)", fontSize: 13 }}>
-                      Se ON, solo l’admin può fare chiamate (override ignorati).
-                    </div>
+                    <div style={{ fontWeight: 900 }}>Blocca vocale per tutti</div>
                   </div>
-                  <button
-                    className="ui-btn"
-                    onClick={() => updateRoomSetting({ lockCalls: !(room?.lockCalls ?? false) })}
-                  >
+                  <button className="ui-btn" onClick={() => updateRoomSetting({ lockCalls: !(room?.lockCalls ?? false) })}>
                     {room?.lockCalls ?? false ? "ON" : "OFF"}
                   </button>
-                </div>
-
-                <div style={{ borderTop: "2px solid var(--border)", paddingTop: 12 }}>
-                  <div style={{ fontWeight: 900 }}>Membri (override)</div>
-                  <div style={{ marginTop: 6, color: "var(--muted)", fontSize: 13 }}>
-                    Qui puoi fare eccezioni sui singoli membri (override).
-                  </div>
-
-                  <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
-                    {members.map((m) => {
-                      const isMe = user?.uid === m.uid;
-                      const isAdminRow = m.role === "admin";
-
-                      const chatLabel =
-                        typeof m.canChat === "boolean" ? (m.canChat ? "ON" : "OFF") : "DEFAULT";
-                      const callLabel =
-                        typeof m.canCall === "boolean" ? (m.canCall ? "ON" : "OFF") : "DEFAULT";
-
-                      return (
-                        <div key={m.uid} style={memberRow}>
-                          <div>
-                            <div style={{ fontWeight: 900 }}>
-                              {m.name} {isMe ? "(tu)" : ""} {isAdminRow ? "👑" : ""}
-                            </div>
-                            <div style={{ marginTop: 4, color: "var(--muted)", fontSize: 12 }}>
-                              uid: {m.uid}
-                            </div>
-                          </div>
-
-                          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                            <button
-                              className="ui-btn"
-                              onClick={async () => {
-                                if (isAdminRow) return;
-                                const next =
-                                  typeof m.canChat === "boolean" ? !m.canChat : false;
-                                await updateDoc(doc(db, "rooms", roomId, "members", m.uid), {
-                                  canChat: next,
-                                } as any);
-                              }}
-                              disabled={isAdminRow}
-                              title={isAdminRow ? "Admin non modificabile" : ""}
-                            >
-                              Chat: <b>{chatLabel}</b>
-                            </button>
-
-                            <button
-                              className="ui-btn"
-                              onClick={async () => {
-                                if (isAdminRow) return;
-                                const next =
-                                  typeof m.canCall === "boolean" ? !m.canCall : false;
-                                await updateDoc(doc(db, "rooms", roomId, "members", m.uid), {
-                                  canCall: next,
-                                } as any);
-                              }}
-                              disabled={isAdminRow}
-                              title={isAdminRow ? "Admin non modificabile" : ""}
-                            >
-                              Call: <b>{callLabel}</b>
-                            </button>
-
-                            <button
-                              className="ui-btn"
-                              onClick={async () => {
-                                if (isAdminRow) return;
-                                await updateDoc(doc(db, "rooms", roomId, "members", m.uid), {
-                                  canChat: null,
-                                  canCall: null,
-                                } as any);
-                              }}
-                              disabled={isAdminRow}
-                              title={isAdminRow ? "Admin non modificabile" : "Reset override → torna a DEFAULT"}
-                            >
-                              Reset override
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
                 </div>
               </div>
             )}
           </div>
         )}
 
-        {/* CALLS */}
+        {/* ✅ VOICE ROOM PANEL */}
         <div className="ui-card" style={{ marginTop: 16 }}>
-          <h2 style={{ fontWeight: 900 }}>Chiamata audio</h2>
-          <p style={{ marginTop: 8, color: "var(--muted)" }}>
-            Crea una chiamata e condividi il link. Chi apre il link e preme “Unisciti” entra in audio.
-          </p>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+            <div>
+              <div style={{ fontWeight: 900, fontSize: 18 }}>Vocale della Room</div>
+              <div style={{ marginTop: 6, color: "var(--muted)" }}>
+                {voiceStatus} {voiceCallId ? "• (attivo)" : "• (spento)"}
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <button className="ui-btn-primary" onClick={enterVoice} disabled={!user || !effectiveCanCall || inVoice}>
+                Entra in vocale
+              </button>
+              <button className="ui-btn" onClick={exitVoice} disabled={!user || !inVoice}>
+                Esci
+              </button>
+
+              {isAdmin && (
+                <button className="ui-btn" onClick={closeVoiceForAll}>
+                  Chiudi vocale (tutti)
+                </button>
+              )}
+            </div>
+          </div>
 
           {!effectiveCanCall && (
             <div style={{ marginTop: 10, color: "var(--muted)" }}>
-              ⚠️ In questa room non hai permesso per le chiamate.
+              ⚠️ In questa room non hai permesso per il vocale.
             </div>
           )}
 
-          <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <button className="ui-btn-primary" onClick={createCall} disabled={!user || !effectiveCanCall}>
-              Crea chiamata
-            </button>
-
-            <button className="ui-btn" onClick={joinCall} disabled={!user || !effectiveCanCall || !callId}>
-              Unisciti
-            </button>
-
-            <button className="ui-btn" onClick={hangUp} disabled={!callId && !pcRef.current}>
-              Chiudi
-            </button>
-          </div>
-
-          <div style={{ marginTop: 10, color: "var(--muted)" }}>{callStatus}</div>
-
-          <div style={{ marginTop: 10 }}>
-            <div style={{ fontWeight: 900 }}>Link chiamata</div>
-            <div style={{ marginTop: 6, wordBreak: "break-all" }}>
-              {callLink || "— (crea una chiamata per generare il link)"}
+          <div style={{ marginTop: 12, borderTop: "2px solid var(--border)", paddingTop: 12 }}>
+            <div style={{ fontWeight: 900 }}>In vocale adesso</div>
+            <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {voiceMembers.length === 0 ? (
+                <span className="ui-pill">nessuno</span>
+              ) : (
+                voiceMembers.map((m) => (
+                  <span key={m.uid} className="ui-pill">
+                    {m.name}
+                  </span>
+                ))
+              )}
             </div>
-            <button className="ui-btn" style={{ marginTop: 10 }} onClick={copyCallLink} disabled={!callLink}>
-              Copia link
-            </button>
           </div>
 
           <audio ref={remoteAudioRef} autoPlay />
@@ -851,16 +902,6 @@ const topBar: React.CSSProperties = {
 };
 
 const settingRow: React.CSSProperties = {
-  border: "2px solid var(--border)",
-  borderRadius: 12,
-  padding: 12,
-  display: "flex",
-  justifyContent: "space-between",
-  gap: 12,
-  alignItems: "center",
-};
-
-const memberRow: React.CSSProperties = {
   border: "2px solid var(--border)",
   borderRadius: 12,
   padding: 12,
