@@ -116,12 +116,30 @@ export default function Home() {
 
   return (
     <main style={{ padding: 24, maxWidth: 920, margin: "0 auto" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+      {/* Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
         <div>
           <h1 style={{ fontSize: 28, fontWeight: 900 }}>ScoutHub</h1>
           <p style={{ marginTop: 6, color: "var(--muted)" }}>
             Tema {theme === "dark" ? "scuro" : "chiaro"} • Room salvate • Chat • Chiamate
           </p>
+
+          {/* ✅ Shortcut sezioni */}
+          <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {/* Per ora la tua route è /Calendar (C maiuscola).
+               Quando rinominiamo la cartella a /calendar, cambiamo questo link. */}
+            <button className="ui-btn-primary" onClick={() => (window.location.href = "/Calendar")}>
+              📅 Calendario
+            </button>
+
+            {/* placeholder per prossimi moduli */}
+            <button className="ui-btn" onClick={() => alert("Prossimo step: Sentieri/Mappe")}>
+              🗺️ Sentieri (prossimo)
+            </button>
+            <button className="ui-btn" onClick={() => alert("Prossimo step: Manuali (nodi, progressioni)")}>
+              📚 Manuali (prossimo)
+            </button>
+          </div>
         </div>
 
         <button className="ui-btn" onClick={toggleTheme}>
@@ -129,6 +147,7 @@ export default function Home() {
         </button>
       </div>
 
+      {/* Login */}
       <div className="ui-card" style={{ marginTop: 16 }}>
         {!user ? (
           <>
@@ -149,6 +168,7 @@ export default function Home() {
         )}
       </div>
 
+      {/* Saved rooms */}
       <div className="ui-card" style={{ marginTop: 16 }}>
         <h2 style={{ fontWeight: 900 }}>Le tue room</h2>
 
@@ -165,9 +185,13 @@ export default function Home() {
                   <div style={{ marginTop: 6 }}>
                     <span className="ui-pill">
                       {r.joinCode ? (
-                        <>codice invito: <b>{r.joinCode}</b></>
+                        <>
+                          codice invito: <b>{r.joinCode}</b>
+                        </>
                       ) : (
-                        <>id: <b>{r.id}</b></>
+                        <>
+                          id: <b>{r.id}</b>
+                        </>
                       )}
                     </span>
                   </div>
@@ -182,14 +206,21 @@ export default function Home() {
         )}
       </div>
 
+      {/* Create room */}
       <div className="ui-card" style={{ marginTop: 16 }}>
         <h2 style={{ fontWeight: 900 }}>Crea una room</h2>
-        <input className="ui-input" value={roomName} onChange={(e) => setRoomName(e.target.value)} disabled={!user} />
+        <input
+          className="ui-input"
+          value={roomName}
+          onChange={(e) => setRoomName(e.target.value)}
+          disabled={!user}
+        />
         <button className="ui-btn-primary" style={{ marginTop: 10 }} onClick={createRoom} disabled={!user}>
           ➕ Crea room (genera codice)
         </button>
       </div>
 
+      {/* Join code */}
       <div className="ui-card" style={{ marginTop: 16 }}>
         <h2 style={{ fontWeight: 900 }}>Entra con codice</h2>
         <input
